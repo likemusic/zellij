@@ -8106,6 +8106,10 @@ pub fn pane_info_for_pane(
         .and_then(|(x, y, is_visible)| if is_visible { Some((x, y)) } else { None });
     pane_info.is_selectable = pane.selectable();
     pane_info.title = pane.current_title();
+    // the pending bell, as the pane frame and the stack list show it
+    if pane.get_bell_notification() {
+        pane_info.title.push_str(" [!]");
+    }
     pane_info.exited = pane.exited();
     pane_info.exit_status = pane.exit_status();
     pane_info.is_held = pane.is_held();
