@@ -28,7 +28,7 @@ use std::{
     process::{Child, Command},
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     thread,
     time::Duration,
@@ -45,15 +45,15 @@ pub use async_trait::async_trait;
 /// `spawn_terminal` runs on the plain PTY thread (outside the runtime).
 struct RawFdAsyncReader {
     /// Holds the file before reactor registration; `None` after promotion.
-    pending: Option<File>,
+    pending: Option<Arc<File>>,
     /// Populated on first `read()` inside the Tokio runtime.
-    async_fd: Option<AsyncFd<File>>,
+    async_fd: Option<AsyncFd<Arc<File>>>,
 }
 
 impl RawFdAsyncReader {
-    fn new(fd: RawFd) -> io::Result<Self> {
+    fn new(file: Arc<File>) -> io::Result<Self> {
         // Set O_NONBLOCK so AsyncFd can use epoll correctly
-        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let borrowed_fd = file.as_ref();
         let flags = fcntl(borrowed_fd, FcntlArg::F_GETFL)
             .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
         let mut oflags = OFlag::from_bits_truncate(flags);
@@ -61,7 +61,6 @@ impl RawFdAsyncReader {
         fcntl(borrowed_fd, FcntlArg::F_SETFL(oflags))
             .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
 
-        let file = unsafe { File::from_raw_fd(fd) };
         Ok(Self {
             pending: Some(file),
             async_fd: None,
@@ -69,7 +68,7 @@ impl RawFdAsyncReader {
     }
 
     /// Lazily register with the Tokio reactor on first use.
-    fn get_async_fd(&mut self) -> io::Result<&mut AsyncFd<File>> {
+    fn get_async_fd(&mut self) -> io::Result<&mut AsyncFd<Arc<File>>> {
         if self.async_fd.is_none() {
             let file = self
                 .pending
@@ -280,7 +279,7 @@ fn handle_terminal(
 #[derive(Clone)]
 pub(crate) struct UnixPtyBackend {
     orig_termios: Arc<Mutex<Option<termios::Termios>>>,
-    terminal_id_to_raw_fd: Arc<Mutex<BTreeMap<u32, Option<RawFd>>>>,
+    terminal_files: Arc<Mutex<BTreeMap<u32, Option<Weak<File>>>>>,
     next_terminal_id_counter: Arc<AtomicU32>,
 }
 
@@ -312,7 +311,7 @@ impl UnixPtyBackend {
         }
         Ok(Self {
             orig_termios: Arc::new(Mutex::new(current_termios)),
-            terminal_id_to_raw_fd: Arc::new(Mutex::new(BTreeMap::new())),
+            terminal_files: Arc::new(Mutex::new(BTreeMap::new())),
             next_terminal_id_counter: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -336,15 +335,23 @@ impl UnixPtyBackend {
             quit_cb,
             terminal_id,
         )?;
-        self.terminal_id_to_raw_fd
+        let file = Arc::new(unsafe { File::from_raw_fd(pid_primary) });
+        let async_reader = Box::new(RawFdAsyncReader::new(file.clone())?) as Box<dyn AsyncReader>;
+        self.terminal_files
             .lock()
             .to_anyhow()?
-            .insert(terminal_id, Some(pid_primary));
-        let async_reader = Box::new(
-            RawFdAsyncReader::new(pid_primary)
-                .map_err(|e| anyhow::anyhow!("failed to create async reader: {}", e))?,
-        ) as Box<dyn AsyncReader>;
+            .insert(terminal_id, Some(Arc::downgrade(&file)));
         Ok((async_reader, child_fd))
+    }
+
+    // The reader owns the master. A held pane must not resolve a recycled fd.
+    fn terminal_file(&self, id: u32) -> Option<Arc<File>> {
+        self.terminal_files
+            .lock()
+            .ok()?
+            .get(&id)?
+            .as_ref()?
+            .upgrade()
     }
 
     pub fn set_terminal_size(
@@ -361,16 +368,16 @@ impl UnixPtyBackend {
                 terminal_id, rows, cols
             )
         };
-        match self
-            .terminal_id_to_raw_fd
-            .lock()
-            .to_anyhow()
-            .with_context(err_context)?
-            .get(&terminal_id)
-        {
-            Some(Some(fd)) => {
+        match self.terminal_file(terminal_id) {
+            Some(fd) => {
                 if cols > 0 && rows > 0 {
-                    set_terminal_size_using_fd(*fd, cols, rows, width_in_pixels, height_in_pixels);
+                    set_terminal_size_using_fd(
+                        fd.as_raw_fd(),
+                        cols,
+                        rows,
+                        width_in_pixels,
+                        height_in_pixels,
+                    );
                 }
             },
             _ => {
@@ -385,46 +392,29 @@ impl UnixPtyBackend {
     pub fn write_to_tty_stdin(&self, terminal_id: u32, buf: &[u8]) -> Result<usize> {
         let err_context = || format!("failed to write to stdin of TTY ID {}", terminal_id);
 
-        let fd = match self
-            .terminal_id_to_raw_fd
-            .lock()
-            .to_anyhow()
-            .with_context(err_context)?
-            .get(&terminal_id)
-        {
-            Some(Some(fd)) => *fd,
+        let fd = match self.terminal_file(terminal_id) {
+            Some(fd) => fd,
             _ => {
                 return Err(anyhow!("could not find raw file descriptor")).with_context(err_context)
             },
         };
 
-        try_write_to_fd(fd, buf).with_context(err_context)
+        try_write_to_fd(fd.as_raw_fd(), buf).with_context(err_context)
     }
 
     pub fn tcdrain(&self, terminal_id: u32) -> Result<()> {
         let err_context = || format!("failed to tcdrain to TTY ID {}", terminal_id);
 
-        match self
-            .terminal_id_to_raw_fd
-            .lock()
-            .to_anyhow()
-            .with_context(err_context)?
-            .get(&terminal_id)
-        {
-            Some(Some(fd)) => {
-                termios::tcdrain(unsafe { BorrowedFd::borrow_raw(*fd) }).with_context(err_context)
-            },
+        match self.terminal_file(terminal_id) {
+            Some(fd) => termios::tcdrain(fd.as_ref()).with_context(err_context),
             _ => Err(anyhow!("could not find raw file descriptor")).with_context(err_context),
         }
     }
 
     pub fn tcgetpgrp(&self, terminal_id: u32) -> Option<i32> {
-        match self.terminal_id_to_raw_fd.lock().ok()?.get(&terminal_id) {
-            Some(Some(fd)) => unistd::tcgetpgrp(unsafe { BorrowedFd::borrow_raw(*fd) })
-                .ok()
-                .map(|pgid| pgid.as_raw()),
-            _ => None,
-        }
+        unistd::tcgetpgrp(self.terminal_file(terminal_id)?.as_ref())
+            .ok()
+            .map(|pgid| pgid.as_raw())
     }
 
     pub fn kill(&self, pid: u32) -> Result<()> {
@@ -443,17 +433,14 @@ impl UnixPtyBackend {
     }
 
     pub fn reserve_terminal_id(&self, terminal_id: u32) {
-        self.terminal_id_to_raw_fd
+        self.terminal_files
             .lock()
             .unwrap()
             .insert(terminal_id, None);
     }
 
     pub fn clear_terminal_id(&self, terminal_id: u32) {
-        self.terminal_id_to_raw_fd
-            .lock()
-            .unwrap()
-            .remove(&terminal_id);
+        self.terminal_files.lock().unwrap().remove(&terminal_id);
     }
 
     pub fn next_terminal_id(&self) -> Option<u32> {
@@ -470,6 +457,21 @@ mod tests {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use nix::sys::termios;
     use std::io::Read;
+
+    #[test]
+    fn held_pane_cannot_resolve_a_closed_master() {
+        let backend = UnixPtyBackend::new().unwrap();
+        let file = Arc::new(File::open("/dev/null").unwrap());
+        backend
+            .terminal_files
+            .lock()
+            .unwrap()
+            .insert(21, Some(Arc::downgrade(&file)));
+        let reader = RawFdAsyncReader::new(file).unwrap();
+        assert!(backend.terminal_file(21).is_some());
+        drop(reader);
+        assert!(backend.terminal_file(21).is_none());
+    }
 
     /// Verify that `try_write_to_fd` writes as many bytes as the kernel will
     /// accept in one pass and returns a partial count (not an error) when the
